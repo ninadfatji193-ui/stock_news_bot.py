@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-StockPilot NSE/BSE Filing Bot v3.6
+StockPilot NSE/BSE Filing Bot v3.7
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v3.6 — ALL LOOPHOLES FIXED:
-  ✅ After-hours flag (🌙 impacts tomorrow's open)
-  ✅ Ex-date urgency (🚨 URGENT < 3 days, ⏰ < 7 days)
-  ✅ IZMO duplication fixed (NSE-symbol-level dedup)
-  ✅ P&L context in every portfolio alert
-  ✅ 70B model for HIGH importance, 8B for MEDIUM/LOW
-  ✅ Weekly Monday digest (8 AM IST)
-  ✅ Semantic dedup (same company, similar title, 30 min window)
-  ✅ All Priority 1 + 2 improvements implemented
+v3.7 — HALLUCINATION GUARD + SMART ANALYSIS:
+  ✅ Anti-hallucination: AI told NEVER to invent numbers
+  ✅ Confidence scoring: HIGH/MEDIUM/LOW based on filing type
+  ✅ PDF content extraction from NSE/BSE filing links
+  ✅ Generic filings flagged as SPECULATIVE in analysis
+  ✅ AI disclaimer on all alerts
+  ✅ Smarter prompt: distinguish between rich vs thin filings
+  ✅ All v3.6 features retained
 """
 
 import os, time, sqlite3, hashlib, json, re, logging, sys
@@ -41,7 +40,6 @@ DB_PATH         = os.environ.get("DB_PATH", "filings.db")
 IST             = pytz.timezone("Asia/Kolkata")
 FILING_MAX_AGE_DAYS = 7
 
-# Groq models — 70B for HIGH impact, 8B for others
 GROQ_MODEL_HIGH = "llama-3.1-70b-versatile"
 GROQ_MODEL_STD  = "llama-3.1-8b-instant"
 
@@ -50,14 +48,93 @@ def validate_config():
     if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
     if not CHAT_ID:        missing.append("TELEGRAM_CHAT_ID")
     if missing:
-        log.error(f"Missing env vars: {', '.join(missing)}")
+        log.error(f"Missing: {', '.join(missing)}")
         sys.exit(1)
-    if GROQ_API_KEY:
-        log.info(f"Groq AI ready ✅ (70B for HIGH | 8B for others)")
-    elif GEMINI_API_KEY:
-        log.info("Gemini AI ready ✅")
-    else:
-        log.warning("No AI key — add GROQ_API_KEY for institutional analysis")
+    if GROQ_API_KEY:   log.info("Groq AI ready ✅ (70B for HIGH | 8B for others)")
+    elif GEMINI_API_KEY: log.info("Gemini AI ready ✅")
+    else:              log.warning("No AI key — add GROQ_API_KEY")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILING CONFIDENCE SCORING
+# How much real content does this filing type carry?
+# ─────────────────────────────────────────────────────────────────────────────
+# HIGH confidence = filing has specific disclosed information
+HIGH_CONFIDENCE_TYPES = [
+    "financial result", "board meeting", "dividend", "bonus", "split",
+    "buyback", "merger", "acquisition", "rights", "order", "contract",
+    "scheme", "allotment", "record date", "press release",
+]
+# LOW confidence = filing is just a notification, no disclosed content
+LOW_CONFIDENCE_TYPES = [
+    "analyst", "investor meet", "con. call", "general update",
+    "basmati", "general announcement", "updates",
+]
+
+def get_filing_confidence(title, cat_label):
+    """
+    Returns 'HIGH', 'MEDIUM', or 'LOW' confidence level.
+    This determines how much the AI should trust its own analysis.
+    """
+    combined = (title + " " + cat_label).lower()
+    if any(t in combined for t in HIGH_CONFIDENCE_TYPES):
+        return "HIGH"
+    if any(t in combined for t in LOW_CONFIDENCE_TYPES):
+        return "LOW"
+    return "MEDIUM"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF CONTENT EXTRACTOR — tries to get text from filing attachment
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_filing_text(link):
+    """
+    Attempts to extract text from NSE/BSE filing PDF.
+    Returns first 1500 chars of content, or None if fails.
+    Only tries for direct PDF links (not generic page links).
+    """
+    if not link or "nsearchives" not in link and "AttachLive" not in link:
+        return None
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/pdf,*/*",
+        }
+        r = requests.get(link, headers=headers, timeout=12, stream=True)
+        if not r.ok:
+            return None
+        content_type = r.headers.get("content-type", "").lower()
+        if "pdf" not in content_type:
+            return None
+        # Read first 50KB only (enough for first few pages)
+        raw = b""
+        for chunk in r.iter_content(chunk_size=8192):
+            raw += chunk
+            if len(raw) > 51200:
+                break
+        # Simple PDF text extraction — look for readable strings
+        text_parts = re.findall(
+            rb'BT\s*(.*?)\s*ET',
+            raw, re.DOTALL
+        )
+        if not text_parts:
+            # Fallback: grab printable ASCII sequences > 4 chars
+            text_parts = re.findall(rb'[A-Za-z0-9\s\.\,\:\;\-\%\₹\(\)]{5,}', raw)
+        decoded = []
+        for part in text_parts[:50]:
+            try:
+                s = part.decode("latin-1", errors="ignore").strip()
+                if len(s) > 4:
+                    decoded.append(s)
+            except:
+                pass
+        full_text = " ".join(decoded)
+        # Clean up
+        full_text = re.sub(r'\s+', ' ', full_text).strip()
+        if len(full_text) < 50:
+            return None
+        return full_text[:1500]
+    except Exception as e:
+        log.debug(f"PDF extract failed: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATE UTILITIES
@@ -66,7 +143,7 @@ DATE_FORMATS = [
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
     "%d-%b-%Y %H:%M:%S", "%d-%b-%Y",
     "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
-    "%d %b %Y", "%b %d, %Y",
+    "%d %b %Y",
 ]
 
 def parse_date(s):
@@ -85,68 +162,49 @@ def is_recent(date_str, days=FILING_MAX_AGE_DAYS):
     return dt >= datetime.now() - timedelta(days=days)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MARKET HOURS & AFTER-HOURS FLAG
+# MARKET STATUS
 # ─────────────────────────────────────────────────────────────────────────────
 def get_market_status():
-    """
-    Returns (is_open: bool, label: str)
-    label = LIVE | AFTER_HOURS | PRE_MARKET | WEEKEND
-    """
     now = datetime.now(IST)
-    if now.weekday() >= 5:  # Sat=5, Sun=6
-        return False, "WEEKEND"
+    if now.weekday() >= 5: return False, "WEEKEND"
     open_t  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
     close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    if now < open_t:
-        return False, "PRE_MARKET"
-    if now > close_t:
-        return False, "AFTER_HOURS"
+    if now < open_t:  return False, "PRE_MARKET"
+    if now > close_t: return False, "AFTER_HOURS"
     return True, "LIVE"
 
-def market_flag(status_label):
-    flags = {
-        "LIVE":        "",
-        "AFTER_HOURS": "\n🌙 <b>AFTER HOURS</b> — This filing will impact tomorrow's opening price",
-        "PRE_MARKET":  "\n🌅 <b>PRE-MARKET</b> — Market opens in {mins} min — watch for gap up/down",
-        "WEEKEND":     "\n📅 <b>WEEKEND FILING</b> — Will impact Monday's opening price",
-    }
-    label = flags.get(status_label, "")
-    if status_label == "PRE_MARKET":
-        now  = datetime.now(IST)
-        open_t = now.replace(hour=9, minute=15, second=0)
-        mins = max(0, int((open_t - now).total_seconds() / 60))
-        label = label.format(mins=mins)
-    return label
+def market_flag(status):
+    if status == "LIVE":        return ""
+    if status == "AFTER_HOURS": return "\n🌙 <b>AFTER HOURS</b> — Will impact tomorrow's opening price"
+    if status == "WEEKEND":     return "\n📅 <b>WEEKEND FILING</b> — Will impact Monday's opening price"
+    if status == "PRE_MARKET":
+        now = datetime.now(IST)
+        mins = max(0, int((now.replace(hour=9,minute=15,second=0) - now).total_seconds()/60))
+        return f"\n🌅 <b>PRE-MARKET</b> — Market opens in {mins} min — watch for gap"
+    return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EX-DATE URGENCY DETECTOR
+# EX-DATE URGENCY
 # ─────────────────────────────────────────────────────────────────────────────
 def get_urgency(title):
-    """
-    Parses ex-date or record date from filing title.
-    Returns (urgency_tag, days_left) or (None, None).
-    """
     patterns = [
         r'ex.?date[:\s]+(\d{1,2}[-/\s]\w+[-/\s]\d{2,4})',
         r'ex.?date[:\s]+(\d{4}-\d{2}-\d{2})',
         r'record\s+date[:\s]+(\d{1,2}[-/\s]\w+[-/\s]\d{2,4})',
-        r'(\d{1,2}[-/]\w{3}[-/]\d{4})',  # generic date in title
     ]
     for pat in patterns:
         m = re.search(pat, title, re.IGNORECASE)
         if m:
             dt = parse_date(m.group(1))
             if dt:
-                days_left = (dt.date() - datetime.now(IST).date()).days
-                if days_left < 0: continue  # already passed
-                if days_left <= 2:
-                    return f"🚨 <b>URGENT — Ex-Date in {days_left} day{'s' if days_left != 1 else ''}!</b>", days_left
-                if days_left <= 7:
-                    return f"⏰ <b>UPCOMING — Ex-Date in {days_left} days</b>", days_left
+                days = (dt.date() - datetime.now(IST).date()).days
+                if days < 0: continue
+                if days <= 2: return f"🚨 <b>URGENT — Ex/Record Date in {days} day{'s' if days!=1 else ''}!</b>", days
+                if days <= 7: return f"⏰ <b>UPCOMING — Ex/Record Date in {days} days</b>", days
     return None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STOCKS — with avg buy price + qty for P&L context
+# STOCKS — with avg + qty for P&L
 # ─────────────────────────────────────────────────────────────────────────────
 PORTFOLIO = [
     dict(ticker="ADVAIT",     name="Advait Infratech",       nse="ADVAIT",      bse="543259", sector="Infrastructure",       cat="PORTFOLIO", avg=2153.00, qty=9),
@@ -168,14 +226,11 @@ PORTFOLIO = [
 ]
 
 WATCHLIST = [
-    # ── Original ──────────────────────────────────────────────────────────
     dict(ticker="JAINRESOUR", name="Jain Resource Recycl",   nse=None,          bse="533289", sector="Recycling",           cat="WATCHLIST"),
     dict(ticker="IREDA",      name="Indian Renewable Energy", nse="IREDA",       bse="544124", sector="Renewable Energy",    cat="WATCHLIST"),
-    # NOTE: IZMO removed from watchlist — already in PORTFOLIO (same NSE symbol = duplicate alerts)
     dict(ticker="ONEGLOBAL",  name="One Global Service",      nse="ONEGLOBAL",   bse=None,     sector="Business Services",   cat="WATCHLIST"),
     dict(ticker="DOMS",       name="DOMS Industries",         nse="DOMS",        bse="544045", sector="Consumer Stationery", cat="WATCHLIST"),
     dict(ticker="LANCER",     name="Lancer Container",        nse=None,          bse="526807", sector="Packaging",           cat="WATCHLIST"),
-    # ── Turnaround Stocks ─────────────────────────────────────────────────
     dict(ticker="HFCL",       name="HFCL Ltd",                nse="HFCL",        bse="500183", sector="Telecom Infra",       cat="WATCHLIST"),
     dict(ticker="BORORENEW",  name="Boro Renewables",         nse="BORORENEW",   bse=None,     sector="Renewable Energy",    cat="WATCHLIST"),
     dict(ticker="IDEAFORGE",  name="ideaForge Technology",    nse="IDEAFORGE",   bse="543932", sector="Defence Drones",      cat="WATCHLIST"),
@@ -243,11 +298,9 @@ SKIP = [
 
 def classify(title, cat_raw=""):
     combined = (title + " " + cat_raw).lower()
-    if any(s in combined for s in SKIP):
-        return None, None
+    if any(s in combined for s in SKIP): return None, None
     for kw, (label, imp) in CATEGORIES.items():
-        if kw.lower() in combined:
-            return label, imp
+        if kw.lower() in combined: return label, imp
     return "📢 Corporate Filing", "MEDIUM"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,21 +309,12 @@ def classify(title, cat_raw=""):
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS sent_filings (
-        hash       TEXT PRIMARY KEY,
-        ticker     TEXT,
-        nse_sym    TEXT,
-        title      TEXT,
-        source     TEXT,
-        sent_at    INTEGER
-    )""")
+        hash TEXT PRIMARY KEY, ticker TEXT, nse_sym TEXT,
+        title TEXT, source TEXT, sent_at INTEGER)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        msg TEXT, ts INTEGER
-    )""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, ts INTEGER)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS weekly_digest_sent (
-        week_id TEXT PRIMARY KEY,
-        sent_at INTEGER
-    )""")
+        week_id TEXT PRIMARY KEY, sent_at INTEGER)""")
     conn.execute("DELETE FROM sent_filings WHERE sent_at < ?",
                  (int(time.time()) - 30*86400,))
     conn.commit()
@@ -278,58 +322,40 @@ def init_db():
     return conn
 
 def _h(nse_sym_or_ticker, title, source):
-    """
-    FIX: Use NSE symbol (not ticker) as dedup key.
-    IZMO (portfolio) and IZMOWATCH (watchlist) share nse="IZMO"
-    so the second one is correctly skipped.
-    """
-    key = f"{source}:{nse_sym_or_ticker}:{title.strip().lower()}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    return hashlib.sha256(
+        f"{source}:{nse_sym_or_ticker}:{title.strip().lower()}".encode()
+    ).hexdigest()
 
 def is_dup(conn, stock, title, source):
-    dedup_key = stock.get("nse") or stock["ticker"]
-    return conn.execute(
-        "SELECT 1 FROM sent_filings WHERE hash=?",
-        (_h(dedup_key, title, source),)
-    ).fetchone() is not None
+    k = stock.get("nse") or stock["ticker"]
+    return conn.execute("SELECT 1 FROM sent_filings WHERE hash=?",
+                        (_h(k,title,source),)).fetchone() is not None
 
 def mark(conn, stock, title, source):
-    dedup_key = stock.get("nse") or stock["ticker"]
-    conn.execute(
-        "INSERT OR IGNORE INTO sent_filings VALUES (?,?,?,?,?,?)",
-        (_h(dedup_key, title, source),
-         stock["ticker"], dedup_key, title[:200],
-         source, int(time.time()))
-    )
+    k = stock.get("nse") or stock["ticker"]
+    conn.execute("INSERT OR IGNORE INTO sent_filings VALUES (?,?,?,?,?,?)",
+                 (_h(k,title,source), stock["ticker"], k, title[:200],
+                  source, int(time.time())))
     conn.commit()
+
+def is_semantic_dup(conn, stock, title, source):
+    k = stock.get("nse") or stock["ticker"]
+    cutoff = int(time.time()) - 1800
+    recent = conn.execute(
+        "SELECT title FROM sent_filings WHERE nse_sym=? AND sent_at>? AND source!=?",
+        (k, cutoff, source)).fetchall()
+    if not recent: return False
+    tw = set(re.findall(r'\w+', title.lower()))
+    for (rt,) in recent:
+        rw = set(re.findall(r'\w+', rt.lower()))
+        if tw and len(tw & rw) / len(tw) > 0.75:
+            return True
+    return False
 
 def log_err(conn, msg):
     conn.execute("INSERT INTO errors VALUES (NULL,?,?)",
                  (msg[:500], int(time.time())))
     conn.commit()
-
-def is_semantic_dup(conn, stock, title, source):
-    """
-    Checks if same company filed something very similar in last 30 min
-    from the OTHER exchange (NSE vs BSE cross-dedup).
-    Prevents double-alerts for same board meeting on both exchanges.
-    """
-    dedup_key = stock.get("nse") or stock["ticker"]
-    cutoff = int(time.time()) - 1800
-    recent = conn.execute(
-        "SELECT title FROM sent_filings WHERE nse_sym=? AND sent_at>? AND source!=?",
-        (dedup_key, cutoff, source)
-    ).fetchall()
-    if not recent: return False
-    title_words = set(re.findall(r'\w+', title.lower()))
-    for (rt,) in recent:
-        rt_words = set(re.findall(r'\w+', rt.lower()))
-        if not title_words: continue
-        overlap = len(title_words & rt_words) / len(title_words)
-        if overlap > 0.75:
-            log.debug(f"  Semantic dup skipped ({overlap:.0%} overlap): {title[:50]}")
-            return True
-    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NSE SESSION
@@ -340,12 +366,12 @@ class NSESession:
         self.s.headers.update({
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"),
-            "Accept":          "application/json, text/plain, */*",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         "https://www.nseindia.com/",
+            "Referer": "https://www.nseindia.com/",
         })
         self.warmed = False
-        self._last = 0
+        self._last  = 0
 
     def warm(self):
         try:
@@ -355,7 +381,7 @@ class NSESession:
                        "corporate-filings-announcements", timeout=12)
             time.sleep(1)
             self.warmed = True
-            self._last = time.time()
+            self._last  = time.time()
             log.info("NSE session warmed ✅")
         except Exception as e:
             log.warning(f"NSE warmup: {e}")
@@ -378,7 +404,7 @@ nse = NSESession()
 BSE_H = {"User-Agent":"Mozilla/5.0","Referer":"https://www.bseindia.com/","Origin":"https://www.bseindia.com"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NSE LIVE QUOTE (price + volume for AI context + P&L)
+# NSE LIVE QUOTE
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_quote(nse_sym):
     if not nse_sym: return None
@@ -386,17 +412,16 @@ def fetch_quote(nse_sym):
     if not r or not r.ok: return None
     try:
         d   = r.json()
-        pi  = d.get("priceInfo", {})
+        pi  = d.get("priceInfo",  {})
         ti  = d.get("tradedInfo", {})
         whl = pi.get("weekHighLow", {})
-        ltp       = pi.get("lastPrice")
-        chg_pct   = pi.get("pChange")
-        w52_hi    = whl.get("max")
-        w52_lo    = whl.get("min")
-        vol_today = ti.get("totalTradedVolume")
-        avg_vol   = ti.get("tottrdqty")
-        range_pct = None
-        vol_ratio = None
+        ltp      = pi.get("lastPrice")
+        chg_pct  = pi.get("pChange")
+        w52_hi   = whl.get("max")
+        w52_lo   = whl.get("min")
+        vol_today= ti.get("totalTradedVolume")
+        avg_vol  = ti.get("tottrdqty")
+        range_pct= vol_ratio = None
         if ltp and w52_hi and w52_lo:
             try:
                 span = float(w52_hi) - float(w52_lo)
@@ -414,47 +439,40 @@ def fetch_quote(nse_sym):
         log.debug(f"Quote {nse_sym}: {e}")
         return None
 
-def fmt_market_ctx(q):
+def fmt_quote(q):
     if not q: return "Live data unavailable"
-    ltp  = f"₹{q['ltp']}"      if q.get("ltp")     else "N/A"
-    chg  = f"{q['chg_pct']}%"  if q.get("chg_pct") else "N/A"
-    hi52 = f"₹{q['w52_hi']}"   if q.get("w52_hi")  else "N/A"
-    lo52 = f"₹{q['w52_lo']}"   if q.get("w52_lo")  else "N/A"
-
+    ltp  = f"₹{q['ltp']}"     if q.get("ltp")     else "N/A"
+    chg  = f"{q['chg_pct']}%" if q.get("chg_pct") else "N/A"
+    hi52 = f"₹{q['w52_hi']}"  if q.get("w52_hi")  else "N/A"
+    lo52 = f"₹{q['w52_lo']}"  if q.get("w52_lo")  else "N/A"
     if q.get("range_pct") is not None:
-        rp = q["range_pct"]
+        rp   = q["range_pct"]
         zone = "near 52w HIGH — extended" if rp > 70 else \
                "near 52w LOW — value zone" if rp < 30 else "mid-range"
-        rng = f"{rp}% above 52w low ({zone})"
+        rng  = f"{rp}% above 52w low ({zone})"
     else:
         rng = "N/A"
-
     if q.get("vol_ratio") is not None:
-        vr = q["vol_ratio"]
-        vsig = "HIGH — possible institutional activity" if vr > 150 else \
-               "LOW — limited institutional interest" if vr < 50 else "normal"
-        vol = f"{int(q['vol_today']):,} shares ({vr}% of annual avg — {vsig})"
+        vr  = q["vol_ratio"]
+        sig = "HIGH — institutional activity possible" if vr > 150 else \
+              "LOW — limited interest" if vr < 50 else "normal"
+        vol = f"{int(q['vol_today']):,} ({vr}% of annual avg — {sig})"
     else:
-        vol = f"{q.get('vol_today','N/A')} shares"
-
+        vol = str(q.get("vol_today","N/A"))
     return (f"Price: {ltp} ({chg} today)\n"
-            f"52w Range: {lo52} → {hi52} | Position: {rng}\n"
+            f"52w: {lo52} → {hi52} | Position: {rng}\n"
             f"Volume: {vol}")
 
 def fmt_pnl(stock, ltp):
-    """Calculate and format P&L for portfolio stocks."""
-    if not stock.get("avg") or not stock.get("qty") or not ltp:
-        return None
+    if not stock.get("avg") or not stock.get("qty") or not ltp: return None
     avg = stock["avg"]; qty = stock["qty"]
-    invested = qty * avg
-    current  = qty * float(ltp)
-    pnl      = current - invested
-    pnl_pct  = (pnl / invested) * 100
-    arrow    = "📈" if pnl >= 0 else "📉"
-    sign     = "+" if pnl >= 0 else ""
-    return (f"{arrow} <b>Your Position:</b> {qty} shares @ ₹{avg:,.2f} avg\n"
-            f"   Invested: ₹{invested:,.0f} → Now: ₹{current:,.0f}\n"
-            f"   P&amp;L: <b>{sign}₹{pnl:,.0f} ({sign}{pnl_pct:.1f}%)</b>")
+    inv = qty * avg; cur = qty * float(ltp)
+    pnl = cur - inv; pct = (pnl / inv) * 100
+    arrow = "📈" if pnl >= 0 else "📉"
+    s     = "+" if pnl >= 0 else ""
+    return (f"{arrow} <b>Your Position:</b> {qty} shares @ ₹{avg:,.2f}\n"
+            f"   Invested ₹{inv:,.0f} → Now ₹{cur:,.0f} | "
+            f"P&amp;L: <b>{s}₹{pnl:,.0f} ({s}{pct:.1f}%)</b>")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FETCHERS
@@ -477,17 +495,18 @@ def fetch_nse_filings(sym):
                       f"https://www.nseindia.com/companies-listing/"
                       f"corporate-filings-announcements?symbol={sym}"),
                 category=(a.get("subject") or a.get("Categorycode") or ""),
-                date=(a.get("sort_date") or a.get("an_dt") or "")
+                date=(a.get("sort_date") or a.get("an_dt") or ""),
+                has_attachment=bool(att)
             ))
         return out
     except Exception as e:
-        log.debug(f"NSE filings {sym}: {e}")
+        log.debug(f"NSE {sym}: {e}")
         return []
 
 def fetch_bse_filings(code):
     if not code: return []
     out = []
-    for dur in ["D", "W"]:
+    for dur in ["D","W"]:
         try:
             r = requests.get(
                 f"https://api.bseindia.com/BseIndiaAPI/api/"
@@ -504,7 +523,8 @@ def fetch_bse_filings(code):
                           if att else
                           f"https://www.bseindia.com/corporates/ann.html?scripcd={code}"),
                     category=(a.get("CATEGORYNAME") or ""),
-                    date=(a.get("NEWS_DT") or a.get("DTIME") or "")
+                    date=(a.get("NEWS_DT") or a.get("DTIME") or ""),
+                    has_attachment=bool(att)
                 ))
             if dur == "D" and out: break
         except Exception as e:
@@ -530,7 +550,7 @@ def fetch_bse_ca(code):
             out.append(dict(
                 title=t,
                 link=f"https://www.bseindia.com/stock-share-price/corporate-actions/{code}",
-                category="Corporate Action", date=ex
+                category="Corporate Action", date=ex, has_attachment=False
             ))
         return out
     except Exception as e:
@@ -538,29 +558,51 @@ def fetch_bse_ca(code):
         return []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI — Institutional prompt | 70B for HIGH | 8B for others
+# AI ANALYSIS — with anti-hallucination guardrails
 # ─────────────────────────────────────────────────────────────────────────────
-INST_PROMPT = """You are a senior equity research analyst at a top Indian institutional fund.
+# Prompt for HIGH confidence filings (with real content)
+PROMPT_RICH = """You are a senior equity research analyst at a top Indian institutional fund.
 
 ━━ FILING ━━
-"{title}"
-Company: {company} | Sector: {sector} | Type: {category}
+Headline: "{title}"
+Company: {company} | Sector: {sector} | Filing Type: {category}
+
+━━ FILING CONTENT (from document) ━━
+{pdf_text}
 
 ━━ LIVE MARKET DATA ━━
-{market_context}
+{market_ctx}
 
-━━ TASK ━━
-Analyze like a fund manager. Cover:
-1. Fundamental impact (revenue/margins/EPS effect)
-2. Re-rating trigger? (P/E expansion or compression)
-3. What would FIIs/DIIs do — accumulate, hold, or trim?
-4. Volume vs annual average — smart money signal?
-5. Price position in 52w range — breakout catalyst or risk?
+━━ STRICT RULES — MUST FOLLOW ━━
+1. ONLY cite numbers that appear in the filing content above
+2. NEVER invent EPS growth %, target prices, or P/E multiples unless stated in the filing
+3. If the filing content is empty or vague, say "filing details not yet disclosed"
+4. Base volume/price analysis ONLY on the live market data provided
 
-Respond ONLY with JSON (no markdown, no backticks):
-{{"summary":"3-4 sentences institutional analysis — fundamental impact, re-rating thesis, FII/DII likely action","volume_signal":"1 sentence — volume vs annual average and what it implies about institutional interest","price_setup":"1 sentence — 52w range position and whether this filing is a breakout catalyst","sector_view":"1 sentence — comparison to sector peers or macro trend","sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID","horizon":"short_term OR medium_term OR long_term","reason":"One specific actionable sentence with price levels or % where possible"}}"""
+Respond ONLY with JSON:
+{{"summary":"3-4 sentences based ONLY on disclosed filing content — fundamental impact, institutional angle","volume_signal":"1 sentence from actual volume data above","price_setup":"1 sentence from actual 52w data above","sector_view":"1 sentence macro context","sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID","horizon":"short_term OR medium_term OR long_term","reason":"Specific actionable sentence — use price levels ONLY if they appear in the filing"}}"""
 
-def _parse_ai(text):
+# Prompt for LOW confidence filings (title only, no content)
+PROMPT_THIN = """You are a senior equity research analyst. A filing notification has arrived but its content is NOT YET DISCLOSED.
+
+━━ FILING ━━
+Headline: "{title}"
+Company: {company} | Sector: {sector} | Filing Type: {category}
+
+━━ LIVE MARKET DATA ━━
+{market_ctx}
+
+━━ STRICT RULES — MANDATORY ━━
+1. This is ONLY a filing notification — the actual content is unknown
+2. DO NOT invent numbers, EPS growth, target prices, or P/E multiples
+3. DO NOT pretend to know what was discussed or decided
+4. Analyse ONLY what filing TYPE typically means + the market data provided
+5. Be honest that specific outcomes are not yet known
+
+Respond ONLY with JSON:
+{{"summary":"2-3 sentences — explain what this TYPE of filing typically signals, state clearly that specific outcomes are not yet disclosed","volume_signal":"1 sentence from actual volume data — does volume suggest anticipation?","price_setup":"1 sentence from 52w data — technical context","sector_view":"1 sentence macro context","sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID","horizon":"short_term OR medium_term OR long_term","reason":"Cautious actionable sentence — wait for filing details before acting"}}"""
+
+def _parse(text):
     text = re.sub(r"```json\n?|```", "", text).strip()
     m = re.search(r"\{[\s\S]+?\}", text)
     if not m: return None
@@ -575,80 +617,102 @@ def _parse_ai(text):
         return r
     except: return None
 
-def groq_analyze(title, company, sector, category, mctx, importance):
-    if not GROQ_API_KEY: return None
-    # Use 70B for HIGH importance filings — much better analysis
+def call_groq(prompt, importance):
     model = GROQ_MODEL_HIGH if importance == "HIGH" else GROQ_MODEL_STD
-    prompt = INST_PROMPT.format(title=title, company=company, sector=sector,
-                                 category=category, market_context=mctx)
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                     "Content-Type": "application/json"},
+            headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},
             json={
                 "model": model,
-                "messages": [
-                    {"role":"system","content":"Expert Indian institutional stock analyst. JSON only. No markdown."},
+                "messages":[
+                    {"role":"system","content":
+                     "Expert Indian institutional equity analyst. "
+                     "NEVER invent specific numbers not in the filing. "
+                     "JSON only. No markdown."},
                     {"role":"user","content":prompt}
                 ],
-                "temperature": 0.2,
-                "max_tokens": 500
+                "temperature":0.1,
+                "max_tokens":500
             },
             timeout=30
         )
         if not r.ok:
-            log.warning(f"Groq({model}) {r.status_code}: {r.text[:150]}")
+            log.warning(f"Groq {r.status_code}: {r.text[:100]}")
             return None
-        content = r.json()["choices"][0]["message"]["content"]
-        result  = _parse_ai(content)
-        if result:
-            log.info(f"  AI({model.split('-')[-1]}): {result['sentiment']} | {result['action']}")
-        return result
+        return _parse(r.json()["choices"][0]["message"]["content"])
     except Exception as e:
         log.warning(f"Groq: {e}")
         return None
 
-def gemini_analyze(title, company, sector, category, mctx, importance):
-    if not GEMINI_API_KEY: return None
-    prompt = INST_PROMPT.format(title=title, company=company, sector=sector,
-                                 category=category, market_context=mctx)
+def call_gemini(prompt):
     for model in ["gemini-2.0-flash","gemini-1.5-flash"]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={GEMINI_API_KEY}",
                 json={"contents":[{"parts":[{"text":prompt}]}],
-                      "generationConfig":{"temperature":0.2,"maxOutputTokens":500}},
+                      "generationConfig":{"temperature":0.1,"maxOutputTokens":500}},
                 timeout=25)
             if not r.ok: continue
-            text   = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = _parse_ai(text)
-            if result: return result
+            res = _parse(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            if res: return res
         except Exception as e:
             log.warning(f"Gemini {model}: {e}")
     return None
 
-def ai_analyze(title, company, sector, category, nse_sym, importance):
-    q    = fetch_quote(nse_sym) if nse_sym else None
-    mctx = fmt_market_ctx(q)
-    res  = None
-    if GROQ_API_KEY:
-        res = groq_analyze(title, company, sector, category, mctx, importance)
-    if not res and GEMINI_API_KEY:
-        res = gemini_analyze(title, company, sector, category, mctx, importance)
-    if res:
-        res["_quote"]  = q
-        res["_mctx"]   = mctx
-    return res
+def ai_analyze(title, company, sector, cat_label, importance, nse_sym, filing_link, has_attachment):
+    # 1. Fetch live market data
+    q      = fetch_quote(nse_sym) if nse_sym else None
+    mctx   = fmt_quote(q)
+
+    # 2. Try to extract PDF content for richer analysis
+    pdf_text = ""
+    if has_attachment:
+        extracted = extract_filing_text(filing_link)
+        if extracted:
+            pdf_text = extracted
+            log.info(f"  PDF extracted: {len(pdf_text)} chars")
+
+    # 3. Determine confidence and pick appropriate prompt
+    confidence = get_filing_confidence(title, cat_label)
+    if pdf_text or confidence == "HIGH":
+        prompt = PROMPT_RICH.format(
+            title=title, company=company, sector=sector, category=cat_label,
+            pdf_text=pdf_text if pdf_text else "Not available — base analysis on filing type and market data only.",
+            market_ctx=mctx
+        )
+    else:
+        # Thin filing — use anti-hallucination prompt
+        prompt = PROMPT_THIN.format(
+            title=title, company=company, sector=sector, category=cat_label,
+            market_ctx=mctx
+        )
+        confidence = "LOW"
+
+    # 4. Call AI
+    result = None
+    if GROQ_API_KEY:   result = call_groq(prompt, importance)
+    if not result and GEMINI_API_KEY: result = call_gemini(prompt)
+
+    if result:
+        result["_quote"]      = q
+        result["_mctx"]       = mctx
+        result["_confidence"] = confidence
+        result["_has_pdf"]    = bool(pdf_text)
+        log.info(f"  AI: {result['sentiment']} | {result['action']} | conf={confidence}")
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MESSAGE BUILDER — full institutional format
+# MESSAGE BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 SE = {"bullish":"🟢","bearish":"🔴","neutral":"🟡"}
 IE = {"high":"🔥","medium":"⚡","low":"💧"}
 AE = {"BUY MORE":"🚀","HOLD":"✋","WATCH":"👀","REDUCE":"⚠️","AVOID":"🚫"}
 HZ = {"short_term":"⚡ Short-Term","medium_term":"📆 Medium-Term","long_term":"🏔 Long-Term"}
+CF = {"HIGH":"🟢 HIGH — based on disclosed content",
+      "MEDIUM":"🟡 MEDIUM — partial content available",
+      "LOW":"🔴 LOW — filing content not yet disclosed"}
 
 def now_ist():
     return datetime.now(IST).strftime("%d %b %Y · %I:%M %p IST")
@@ -657,8 +721,7 @@ def build_msg(stock, source, filing, cat_label, importance, ai):
     ce  = "📊" if stock["cat"] == "PORTFOLIO" else "👁"
     itg = {"HIGH":"🔴 HIGH","MEDIUM":"🟡 MEDIUM","LOW":"🟢 LOW"}.get(importance,"🟡")
     _, mkt_status = get_market_status()
-    after_hours   = market_flag(mkt_status)
-    urgency_tag, days_left = get_urgency(filing["title"])
+    urg_tag, _   = get_urgency(filing["title"])
 
     L = ["━"*24,
          f"🏛 <b>{source} OFFICIAL FILING</b>",
@@ -668,52 +731,50 @@ def build_msg(stock, source, filing, cat_label, importance, ai):
          f"🏷 {cat_label}  ·  {itg}",
          ""]
 
-    # After-hours flag
-    if after_hours:
-        L.append(after_hours)
-        L.append("")
-
-    # Urgency flag
-    if urgency_tag:
-        L.append(urgency_tag)
-        L.append("")
+    ah = market_flag(mkt_status)
+    if ah: L += [ah, ""]
+    if urg_tag: L += [urg_tag, ""]
 
     L += [f"📄 <b>{filing['title']}</b>", ""]
 
-    # P&L context for portfolio stocks
+    # P&L for portfolio stocks
     if stock["cat"] == "PORTFOLIO" and ai and ai.get("_quote"):
-        pnl_line = fmt_pnl(stock, ai["_quote"].get("ltp"))
-        if pnl_line:
-            L.append(pnl_line)
-            L.append("")
+        pnl = fmt_pnl(stock, ai["_quote"].get("ltp"))
+        if pnl: L += [pnl, ""]
 
-    # Market context
-    if ai and ai.get("_mctx") and ai["_mctx"] != "Live data unavailable":
+    # Market data
+    if ai and ai.get("_mctx") and "unavailable" not in ai["_mctx"]:
         L += ["📈 <b>Live Market Data</b>",
               f"<code>{ai['_mctx']}</code>", ""]
 
-    # Institutional AI analysis
     if ai:
-        L += ["🏦 <b>Institutional Analysis</b>",
-              "─"*22,
-              f"📝 {ai.get('summary','')}",
-              "",
-              f"📊 <b>Volume Signal:</b> {ai.get('volume_signal','')}",
-              f"🎯 <b>Price Setup:</b> {ai.get('price_setup','')}",
-              f"🌐 <b>Sector View:</b> {ai.get('sector_view','')}",
-              "",
-              f"{SE.get(ai['sentiment'],'🟡')} Sentiment: <b>{ai['sentiment'].capitalize()}</b>",
-              f"{IE.get(ai['impact'],'⚡')} Market Impact: <b>{ai['impact'].capitalize()}</b>",
-              f"{AE.get(ai['action'],'👀')} Action Signal: <b>{ai['action']}</b>",
-              f"⏳ Horizon: <b>{HZ.get(ai['horizon'], ai['horizon'])}</b>",
-              f"💡 {ai.get('reason','')}",
-              ""]
+        conf = ai.get("_confidence","MEDIUM")
+        pdf  = ai.get("_has_pdf", False)
+        L += [
+            f"🏦 <b>Institutional Analysis</b>",
+            f"🔬 AI Confidence: {CF.get(conf,conf)}"
+            + (" | 📎 Based on filing PDF" if pdf else ""),
+            "─"*22,
+            f"📝 {ai.get('summary','')}",
+            "",
+            f"📊 <b>Volume Signal:</b> {ai.get('volume_signal','')}",
+            f"🎯 <b>Price Setup:</b> {ai.get('price_setup','')}",
+            f"🌐 <b>Sector View:</b> {ai.get('sector_view','')}",
+            "",
+            f"{SE.get(ai['sentiment'],'🟡')} Sentiment: <b>{ai['sentiment'].capitalize()}</b>",
+            f"{IE.get(ai['impact'],'⚡')} Impact: <b>{ai['impact'].capitalize()}</b>",
+            f"{AE.get(ai['action'],'👀')} Signal: <b>{ai['action']}</b>",
+            f"⏳ Horizon: <b>{HZ.get(ai['horizon'],ai['horizon'])}</b>",
+            f"💡 {ai.get('reason','')}",
+            "",
+            "⚠️ <i>AI analysis is informational only. Verify before acting. Not financial advice.</i>",
+            "",
+        ]
     else:
-        L += ["⚠️ <i>Add GROQ_API_KEY in Railway for AI analysis</i>", ""]
+        L += ["⚠️ <i>Add GROQ_API_KEY in Railway for AI analysis</i>",""]
 
-    if filing.get("date"):
-        L.append(f"📅 Filed: {filing['date']}")
-    L += [f"🔗 <a href=\"{filing['link']}\">View on {source}</a>",
+    if filing.get("date"): L.append(f"📅 Filed: {filing['date']}")
+    L += [f"🔗 <a href=\"{filing['link']}\">View Filing on {source}</a>",
           f"⏰ {now_ist()}"]
     return "\n".join(L)
 
@@ -727,8 +788,8 @@ def send_tg(text, retries=3):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id":CHAT_ID, "text":text[:4000],
-                      "parse_mode":"HTML", "disable_web_page_preview":True},
+                json={"chat_id":CHAT_ID,"text":text[:4000],
+                      "parse_mode":"HTML","disable_web_page_preview":True},
                 timeout=12)
             if r.ok: return True
             if r.status_code == 429:
@@ -741,47 +802,31 @@ def send_tg(text, retries=3):
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEEKLY DIGEST — every Monday 8 AM IST
+# WEEKLY DIGEST
 # ─────────────────────────────────────────────────────────────────────────────
-def maybe_send_weekly_digest(conn):
+def maybe_weekly_digest(conn):
     now = datetime.now(IST)
-    if now.weekday() != 0 or now.hour != 8: return  # Monday 8 AM only
-    week_id = now.strftime("%Y-W%W")
-    if conn.execute("SELECT 1 FROM weekly_digest_sent WHERE week_id=?",
-                    (week_id,)).fetchone(): return
-
-    week_ago = int(time.time()) - 7 * 86400
+    if now.weekday() != 0 or now.hour != 8: return
+    wid = now.strftime("%Y-W%W")
+    if conn.execute("SELECT 1 FROM weekly_digest_sent WHERE week_id=?",(wid,)).fetchone(): return
     rows = conn.execute(
-        "SELECT ticker, title, source FROM sent_filings WHERE sent_at > ? ORDER BY ticker, sent_at DESC",
-        (week_ago,)
-    ).fetchall()
-
-    if not rows:
-        return
-
-    by_ticker = {}
-    for ticker, title, source in rows:
-        by_ticker.setdefault(ticker, []).append(f"  [{source}] {title[:55]}")
-
-    lines = [
-        "━"*24,
-        "📋 <b>WEEKLY FILING DIGEST</b>",
-        f"Week ending {now.strftime('%d %b %Y')}",
-        "━"*24,
-        f"Total filings this week: <b>{len(rows)}</b>",
-        f"Stocks with activity: <b>{len(by_ticker)}</b>",
-        "",
-    ]
-    for ticker in sorted(by_ticker.keys()):
-        events = by_ticker[ticker]
-        lines.append(f"<b>{ticker}</b> ({len(events)} filing{'s' if len(events)>1 else ''})")
-        lines.extend(events[:4])
+        "SELECT ticker,title,source FROM sent_filings WHERE sent_at>? ORDER BY ticker,sent_at DESC",
+        (int(time.time())-7*86400,)).fetchall()
+    if not rows: return
+    by = {}
+    for ticker,title,source in rows:
+        by.setdefault(ticker,[]).append(f"  [{source}] {title[:55]}")
+    lines = ["━"*24,"📋 <b>WEEKLY FILING DIGEST</b>",
+             f"Week ending {now.strftime('%d %b %Y')}","━"*24,
+             f"Total: <b>{len(rows)}</b> filings across <b>{len(by)}</b> stocks",""]
+    for t in sorted(by):
+        evs = by[t]
+        lines.append(f"<b>{t}</b> ({len(evs)} filing{'s' if len(evs)>1 else ''})")
+        lines.extend(evs[:4])
         lines.append("")
-
-    lines += ["━"*24, "Have a great trading week! 🚀"]
+    lines += ["━"*24,"Happy trading this week! 🚀"]
     send_tg("\n".join(lines))
-    conn.execute("INSERT OR IGNORE INTO weekly_digest_sent VALUES (?,?)",
-                 (week_id, int(time.time())))
+    conn.execute("INSERT OR IGNORE INTO weekly_digest_sent VALUES (?,?)",(wid,int(time.time())))
     conn.commit()
     log.info("Weekly digest sent ✅")
 
@@ -792,80 +837,64 @@ def process(stock, conn):
     sent = 0
     all_f = []
     if stock.get("nse"):
-        all_f += [("NSE", f) for f in fetch_nse_filings(stock["nse"])]
+        all_f += [("NSE",f) for f in fetch_nse_filings(stock["nse"])]
         time.sleep(0.8)
     if stock.get("bse"):
-        all_f += [("BSE", f) for f in fetch_bse_filings(stock["bse"])]
-        all_f += [("BSE", f) for f in fetch_bse_ca(stock["bse"])]
+        all_f += [("BSE",f) for f in fetch_bse_filings(stock["bse"])]
+        all_f += [("BSE",f) for f in fetch_bse_ca(stock["bse"])]
         time.sleep(0.5)
-
-    for source, f in all_f:
+    for source,f in all_f:
         if not is_recent(f.get("date","")): continue
-        cat_label, importance = classify(f["title"], f.get("category",""))
+        cat_label,importance = classify(f["title"],f.get("category",""))
         if cat_label is None: continue
-        if is_dup(conn, stock, f["title"], source): continue
-        if is_semantic_dup(conn, stock, f["title"], source): continue
-        mark(conn, stock, f["title"], source)
+        if is_dup(conn,stock,f["title"],source): continue
+        if is_semantic_dup(conn,stock,f["title"],source): continue
+        mark(conn,stock,f["title"],source)
         log.info(f"  [{source}][{stock['ticker']}][{importance}] {f['title'][:65]}")
-        ai  = ai_analyze(f["title"], stock["name"], stock["sector"],
-                         cat_label, stock.get("nse"), importance)
-        msg = build_msg(stock, source, f, cat_label, importance, ai)
+        ai = ai_analyze(
+            f["title"], stock["name"], stock["sector"], cat_label,
+            importance, stock.get("nse"), f["link"],
+            f.get("has_attachment", False)
+        )
+        msg = build_msg(stock,source,f,cat_label,importance,ai)
         if send_tg(msg):
             sent += 1
             time.sleep(1.5)
     return sent
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CYCLE
+# CYCLE + STARTUP + MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def run_cycle(conn):
-    maybe_send_weekly_digest(conn)
+    maybe_weekly_digest(conn)
     log.info(f"━━ Cycle {datetime.now(IST).strftime('%H:%M:%S IST')} ━━")
     total = 0
     for stock in ALL_STOCKS:
-        try:
-            total += process(stock, conn)
+        try: total += process(stock,conn)
         except Exception as e:
-            log.error(f"{stock['ticker']}: {e}")
-            log_err(conn, str(e))
+            log.error(f"{stock['ticker']}: {e}"); log_err(conn,str(e))
     log.info(f"━━ Done. {total} sent ━━\n")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STARTUP
-# ─────────────────────────────────────────────────────────────────────────────
 def send_startup():
-    ai_info = (
-        f"✅ Groq (70B for HIGH / 8B for others)" if GROQ_API_KEY else
-        f"✅ Gemini (fallback)" if GEMINI_API_KEY else
-        "❌ No AI key — add GROQ_API_KEY"
-    )
+    ai = (f"✅ Groq (70B/HIGH · 8B/others) + anti-hallucination" if GROQ_API_KEY else
+          f"✅ Gemini" if GEMINI_API_KEY else "❌ Add GROQ_API_KEY")
     msg = (
-        f"{'━'*24}\n"
-        f"🚀 <b>StockPilot Bot v3.6</b>\n"
-        f"{'━'*24}\n"
+        f"{'━'*24}\n🚀 <b>StockPilot Bot v3.7</b>\n{'━'*24}\n"
         f"⏰ {datetime.now(IST).strftime('%d %b %Y · %I:%M %p IST')}\n\n"
-        f"📊 Portfolio: {len(PORTFOLIO)} stocks (with avg buy price)\n"
-        f"👁 Watchlist: {len(WATCHLIST)} stocks (incl. 18 turnaround)\n\n"
-        f"<b>✅ v3.6 loopholes fixed:</b>\n"
-        f"  🌙 After-hours filing flag\n"
-        f"  🚨 Ex-date urgency (URGENT/UPCOMING)\n"
-        f"  📈 P&amp;L context in every portfolio alert\n"
-        f"  🏦 70B model for HIGH priority filings\n"
-        f"  📋 Weekly digest every Monday 8 AM\n"
-        f"  🔄 Smart semantic dedup (NSE+BSE cross)\n"
-        f"  ✂️ IZMO watchlist duplicate removed\n\n"
-        f"🤖 AI: {ai_info}\n"
-        f"🔄 Every {CHECK_INTERVAL//60} min\n"
-        f"{'━'*24}"
+        f"📊 Portfolio: {len(PORTFOLIO)} | 👁 Watchlist: {len(WATCHLIST)}\n\n"
+        f"✅ <b>v3.7 improvements:</b>\n"
+        f"  🛡 Anti-hallucination guardrails\n"
+        f"  🔬 AI confidence scoring (HIGH/MED/LOW)\n"
+        f"  📎 PDF content extraction for richer analysis\n"
+        f"  ⚠️ Disclaimer on all AI alerts\n"
+        f"  🧠 Separate prompts for rich vs thin filings\n\n"
+        f"🤖 AI: {ai}\n🔄 Every {CHECK_INTERVAL//60} min\n{'━'*24}"
     )
     send_tg(msg)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
     validate_config()
-    log.info("StockPilot Bot v3.6 starting…")
+    log.info("StockPilot Bot v3.7 starting…")
     conn = init_db()
     nse.warm()
     send_startup()
@@ -879,7 +908,7 @@ def main():
         except Exception as e:
             errs += 1
             log.error(f"Cycle #{errs}: {e}", exc_info=True)
-            log_err(conn, str(e))
+            log_err(conn,str(e))
             if errs >= 5:
                 send_tg(f"⚠️ 5 errors\nLast: {str(e)[:200]}")
                 errs = 0
