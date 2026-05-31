@@ -117,7 +117,7 @@ def extract_filing_text(link):
         )
         if not text_parts:
             # Fallback: grab printable ASCII sequences > 4 chars
-            text_parts = re.findall(rb'[A-Za-z0-9\s\.\,\:\;\-\%\₹\(\)]{5,}', raw)
+            text_parts = re.findall(rb'[A-Za-z0-9\s\.\,\:\;\-\%\(\)]{5,}', raw)
         decoded = []
         for part in text_parts[:50]:
             try:
