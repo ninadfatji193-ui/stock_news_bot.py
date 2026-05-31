@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-StockPilot NSE/BSE Filing Bot v3.5
+StockPilot NSE/BSE Filing Bot v3.6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v3.5 changes:
-  - FIXED: PENIND → PENNARINT (Pennar Industries, not Pen Industries)
-  - ADDED: 18 turnaround stocks to watchlist
-  - UPGRADED: Institutional-level AI analysis
-  - NEW: NSE live market data (price, 52w range, volume) in every AI prompt
-  - NEW: Weekly vs average volume analysis in AI summary
-  - AI: Groq (LLaMA 3.1) primary | Gemini fallback
+v3.6 — ALL LOOPHOLES FIXED:
+  ✅ After-hours flag (🌙 impacts tomorrow's open)
+  ✅ Ex-date urgency (🚨 URGENT < 3 days, ⏰ < 7 days)
+  ✅ IZMO duplication fixed (NSE-symbol-level dedup)
+  ✅ P&L context in every portfolio alert
+  ✅ 70B model for HIGH importance, 8B for MEDIUM/LOW
+  ✅ Weekly Monday digest (8 AM IST)
+  ✅ Semantic dedup (same company, similar title, 30 min window)
+  ✅ All Priority 1 + 2 improvements implemented
 """
 
 import os, time, sqlite3, hashlib, json, re, logging, sys
@@ -39,6 +41,10 @@ DB_PATH         = os.environ.get("DB_PATH", "filings.db")
 IST             = pytz.timezone("Asia/Kolkata")
 FILING_MAX_AGE_DAYS = 7
 
+# Groq models — 70B for HIGH impact, 8B for others
+GROQ_MODEL_HIGH = "llama-3.1-70b-versatile"
+GROQ_MODEL_STD  = "llama-3.1-8b-instant"
+
 def validate_config():
     missing = []
     if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
@@ -47,25 +53,25 @@ def validate_config():
         log.error(f"Missing env vars: {', '.join(missing)}")
         sys.exit(1)
     if GROQ_API_KEY:
-        log.info("Groq AI ready ✅")
+        log.info(f"Groq AI ready ✅ (70B for HIGH | 8B for others)")
     elif GEMINI_API_KEY:
         log.info("Gemini AI ready ✅")
     else:
         log.warning("No AI key — add GROQ_API_KEY for institutional analysis")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATE FILTER
+# DATE UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 DATE_FORMATS = [
     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
     "%d-%b-%Y %H:%M:%S", "%d-%b-%Y",
     "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
-    "%d %b %Y",
+    "%d %b %Y", "%b %d, %Y",
 ]
 
 def parse_date(s):
     if not s: return None
-    s = s.strip()
+    s = str(s).strip()
     for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(s[:19], fmt)
@@ -79,56 +85,115 @@ def is_recent(date_str, days=FILING_MAX_AGE_DAYS):
     return dt >= datetime.now() - timedelta(days=days)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STOCKS
+# MARKET HOURS & AFTER-HOURS FLAG
+# ─────────────────────────────────────────────────────────────────────────────
+def get_market_status():
+    """
+    Returns (is_open: bool, label: str)
+    label = LIVE | AFTER_HOURS | PRE_MARKET | WEEKEND
+    """
+    now = datetime.now(IST)
+    if now.weekday() >= 5:  # Sat=5, Sun=6
+        return False, "WEEKEND"
+    open_t  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now < open_t:
+        return False, "PRE_MARKET"
+    if now > close_t:
+        return False, "AFTER_HOURS"
+    return True, "LIVE"
+
+def market_flag(status_label):
+    flags = {
+        "LIVE":        "",
+        "AFTER_HOURS": "\n🌙 <b>AFTER HOURS</b> — This filing will impact tomorrow's opening price",
+        "PRE_MARKET":  "\n🌅 <b>PRE-MARKET</b> — Market opens in {mins} min — watch for gap up/down",
+        "WEEKEND":     "\n📅 <b>WEEKEND FILING</b> — Will impact Monday's opening price",
+    }
+    label = flags.get(status_label, "")
+    if status_label == "PRE_MARKET":
+        now  = datetime.now(IST)
+        open_t = now.replace(hour=9, minute=15, second=0)
+        mins = max(0, int((open_t - now).total_seconds() / 60))
+        label = label.format(mins=mins)
+    return label
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EX-DATE URGENCY DETECTOR
+# ─────────────────────────────────────────────────────────────────────────────
+def get_urgency(title):
+    """
+    Parses ex-date or record date from filing title.
+    Returns (urgency_tag, days_left) or (None, None).
+    """
+    patterns = [
+        r'ex.?date[:\s]+(\d{1,2}[-/\s]\w+[-/\s]\d{2,4})',
+        r'ex.?date[:\s]+(\d{4}-\d{2}-\d{2})',
+        r'record\s+date[:\s]+(\d{1,2}[-/\s]\w+[-/\s]\d{2,4})',
+        r'(\d{1,2}[-/]\w{3}[-/]\d{4})',  # generic date in title
+    ]
+    for pat in patterns:
+        m = re.search(pat, title, re.IGNORECASE)
+        if m:
+            dt = parse_date(m.group(1))
+            if dt:
+                days_left = (dt.date() - datetime.now(IST).date()).days
+                if days_left < 0: continue  # already passed
+                if days_left <= 2:
+                    return f"🚨 <b>URGENT — Ex-Date in {days_left} day{'s' if days_left != 1 else ''}!</b>", days_left
+                if days_left <= 7:
+                    return f"⏰ <b>UPCOMING — Ex-Date in {days_left} days</b>", days_left
+    return None, None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STOCKS — with avg buy price + qty for P&L context
 # ─────────────────────────────────────────────────────────────────────────────
 PORTFOLIO = [
-    dict(ticker="ADVAIT",     name="Advait Infratech",       nse="ADVAIT",      bse="543259", sector="Infrastructure",        cat="PORTFOLIO"),
-    dict(ticker="ANANTRAJ",   name="Anant Raj Ltd",          nse="ANANTRAJ",    bse="515055", sector="Real Estate",           cat="PORTFOLIO"),
-    dict(ticker="APOLLO",     name="Apollo Micro Systems",   nse="APOLLOMICRO", bse="543288", sector="Defence Electronics",   cat="PORTFOLIO"),
-    dict(ticker="BEL",        name="Bharat Electronics",     nse="BEL",         bse="500049", sector="Defence PSU",           cat="PORTFOLIO"),
-    dict(ticker="CDSL",       name="CDSL",                   nse="CDSL",        bse="543272", sector="Financial Services",    cat="PORTFOLIO"),
-    dict(ticker="HAL",        name="Hindustan Aeronautics",  nse="HAL",         bse="541154", sector="Defence Aerospace",     cat="PORTFOLIO"),
-    dict(ticker="HAPPSTMNDS", name="Happiest Minds",         nse="HAPPSTMNDS",  bse="543227", sector="IT Services",           cat="PORTFOLIO"),
-    dict(ticker="IFCI",       name="IFCI Ltd",               nse="IFCI",        bse="500106", sector="NBFC",                  cat="PORTFOLIO"),
-    dict(ticker="INOXINDIA",  name="INOX India",             nse="INOXINDIA",   bse="543716", sector="Industrial Gas",        cat="PORTFOLIO"),
-    dict(ticker="IZMO",       name="Izmo Ltd",               nse="IZMO",        bse="532341", sector="Auto Technology",       cat="PORTFOLIO"),
-    dict(ticker="KPEL",       name="K.P. Energy",            nse="KPEL",        bse="540698", sector="Renewable Energy",      cat="PORTFOLIO"),
-    dict(ticker="NETWEB",     name="Netweb Technologies",    nse="NETWEB",      bse="543920", sector="IT Hardware",           cat="PORTFOLIO"),
-    # FIXED: Was "Pen Industries (Media)" — corrected to Pennar Industries (Steel/Engineering)
-    dict(ticker="PENNARINT",  name="Pennar Industries",      nse="PENNARINT",   bse="513228", sector="Steel & Engineering",   cat="PORTFOLIO"),
-    dict(ticker="PGEL",       name="PG Electroplast",        nse="PGEL",        bse="543594", sector="Electronics",           cat="PORTFOLIO"),
-    dict(ticker="REMSONSIND", name="Remsons Industries",     nse="REMSONSIND",  bse="517437", sector="Auto Components",       cat="PORTFOLIO"),
-    dict(ticker="RVNL",       name="Rail Vikas Nigam",       nse="RVNL",        bse="542649", sector="Railways & Infra",      cat="PORTFOLIO"),
+    dict(ticker="ADVAIT",     name="Advait Infratech",       nse="ADVAIT",      bse="543259", sector="Infrastructure",       cat="PORTFOLIO", avg=2153.00, qty=9),
+    dict(ticker="ANANTRAJ",   name="Anant Raj Ltd",          nse="ANANTRAJ",    bse="515055", sector="Real Estate",          cat="PORTFOLIO", avg=567.00,  qty=36),
+    dict(ticker="APOLLO",     name="Apollo Micro Systems",   nse="APOLLOMICRO", bse="543288", sector="Defence Electronics",  cat="PORTFOLIO", avg=271.00,  qty=62),
+    dict(ticker="BEL",        name="Bharat Electronics",     nse="BEL",         bse="500049", sector="Defence PSU",          cat="PORTFOLIO", avg=412.50,  qty=28),
+    dict(ticker="CDSL",       name="CDSL",                   nse="CDSL",        bse="543272", sector="Financial Services",   cat="PORTFOLIO", avg=443.76,  qty=30),
+    dict(ticker="HAL",        name="Hindustan Aeronautics",  nse="HAL",         bse="541154", sector="Defence Aerospace",    cat="PORTFOLIO", avg=2005.55, qty=10),
+    dict(ticker="HAPPSTMNDS", name="Happiest Minds",         nse="HAPPSTMNDS",  bse="543227", sector="IT Services",          cat="PORTFOLIO", avg=880.72,  qty=16),
+    dict(ticker="IFCI",       name="IFCI Ltd",               nse="IFCI",        bse="500106", sector="NBFC",                 cat="PORTFOLIO", avg=264.09,  qty=24),
+    dict(ticker="INOXINDIA",  name="INOX India",             nse="INOXINDIA",   bse="543716", sector="Industrial Gas",       cat="PORTFOLIO", avg=1221.10, qty=2),
+    dict(ticker="IZMO",       name="Izmo Ltd",               nse="IZMO",        bse="532341", sector="Auto Technology",      cat="PORTFOLIO", avg=948.40,  qty=16),
+    dict(ticker="KPEL",       name="K.P. Energy",            nse="KPEL",        bse="540698", sector="Renewable Energy",     cat="PORTFOLIO", avg=543.00,  qty=30),
+    dict(ticker="NETWEB",     name="Netweb Technologies",    nse="NETWEB",      bse="543920", sector="IT Hardware",          cat="PORTFOLIO", avg=3255.00, qty=1),
+    dict(ticker="PENNARINT",  name="Pennar Industries",      nse="PENNARINT",   bse="513228", sector="Steel & Engineering",  cat="PORTFOLIO", avg=235.42,  qty=55),
+    dict(ticker="PGEL",       name="PG Electroplast",        nse="PGEL",        bse="543594", sector="Electronics",          cat="PORTFOLIO", avg=796.30,  qty=23),
+    dict(ticker="REMSONSIND", name="Remsons Industries",     nse="REMSONSIND",  bse="517437", sector="Auto Components",      cat="PORTFOLIO", avg=131.78,  qty=116),
+    dict(ticker="RVNL",       name="Rail Vikas Nigam",       nse="RVNL",        bse="542649", sector="Railways & Infra",     cat="PORTFOLIO", avg=133.04,  qty=136),
 ]
 
 WATCHLIST = [
-    # Original watchlist
-    dict(ticker="JAINRESOUR", name="Jain Resource Recycl",   nse=None,          bse="533289", sector="Recycling",            cat="WATCHLIST"),
-    dict(ticker="IREDA",      name="Indian Renewable Energy", nse="IREDA",       bse="544124", sector="Renewable Energy",     cat="WATCHLIST"),
-    dict(ticker="IZMOWATCH",  name="Izmo Ltd (Watch)",        nse="IZMO",        bse="532341", sector="Auto Technology",      cat="WATCHLIST"),
-    dict(ticker="ONEGLOBAL",  name="One Global Service",      nse="ONEGLOBAL",   bse=None,     sector="Business Services",    cat="WATCHLIST"),
-    dict(ticker="DOMS",       name="DOMS Industries",         nse="DOMS",        bse="544045", sector="Consumer Stationery",  cat="WATCHLIST"),
-    dict(ticker="LANCER",     name="Lancer Container",        nse=None,          bse="526807", sector="Packaging",            cat="WATCHLIST"),
-
-    # ── TURNAROUND STOCKS (from screenshot) ───────────────────────────────
-    dict(ticker="HFCL",       name="HFCL Ltd",                nse="HFCL",        bse="500183", sector="Telecom Infrastructure",  cat="WATCHLIST"),
-    dict(ticker="BORORENEW",  name="Boro Renewables",         nse="BORORENEW",   bse=None,     sector="Renewable Energy",        cat="WATCHLIST"),
-    dict(ticker="IDEAFORGE",  name="ideaForge Technology",    nse="IDEAFORGE",   bse="543932", sector="Defence Drones",          cat="WATCHLIST"),
-    dict(ticker="NAVKARCORP", name="Navkar Corporation",      nse="NAVKARCORP",  bse="539332", sector="Logistics",               cat="WATCHLIST"),
-    dict(ticker="RKFORGE",    name="Ramkrishna Forgings",     nse="RKFORGE",     bse="500368", sector="Auto Forgings",           cat="WATCHLIST"),
-    dict(ticker="SIS",        name="SIS Ltd",                 nse="SIS",         bse="540673", sector="Security Services",       cat="WATCHLIST"),
-    dict(ticker="IBULLSLTD",  name="Indiabulls Ltd",          nse="IBULLSLTD",   bse="535789", sector="NBFC",                    cat="WATCHLIST"),
-    dict(ticker="FABTECH",    name="Fabtech Technologies",    nse="FABTECH",     bse=None,     sector="Engineering",             cat="WATCHLIST"),
-    dict(ticker="E2E",        name="E2E Networks",            nse="E2ENETWORKS", bse="543421", sector="Cloud Infrastructure",    cat="WATCHLIST"),
-    dict(ticker="NPL",        name="NPL",                     nse="NPL",         bse=None,     sector="Manufacturing",           cat="WATCHLIST"),
-    dict(ticker="AURUM",      name="Aurum PropTech",          nse="AURUM",       bse="543088", sector="PropTech",                cat="WATCHLIST"),
-    dict(ticker="MARSONS",    name="Marsons Ltd",             nse="MARSONS",     bse="522080", sector="Electrical Equipment",    cat="WATCHLIST"),
-    dict(ticker="HARSHA",     name="Harsha Engineers",        nse="HARSHA",      bse="543457", sector="Precision Engineering",   cat="WATCHLIST"),
-    dict(ticker="RAYMOND",    name="Raymond Ltd",             nse="RAYMOND",     bse="500330", sector="Lifestyle & Real Estate", cat="WATCHLIST"),
-    dict(ticker="MARINE",     name="Marine Electricals",      nse="MARINE",      bse=None,     sector="Electrical Equipment",    cat="WATCHLIST"),
-    dict(ticker="KMEW",       name="KMEW",                    nse="KMEW",        bse=None,     sector="Manufacturing",           cat="WATCHLIST"),
-    dict(ticker="MODISONLTD", name="Modison Ltd",             nse="MODISONLTD",  bse=None,     sector="Electrical Contacts",     cat="WATCHLIST"),
-    dict(ticker="RATEGAIN",   name="RateGain Travel Tech",    nse="RATEGAIN",    bse="543417", sector="Travel Technology SaaS",  cat="WATCHLIST"),
+    # ── Original ──────────────────────────────────────────────────────────
+    dict(ticker="JAINRESOUR", name="Jain Resource Recycl",   nse=None,          bse="533289", sector="Recycling",           cat="WATCHLIST"),
+    dict(ticker="IREDA",      name="Indian Renewable Energy", nse="IREDA",       bse="544124", sector="Renewable Energy",    cat="WATCHLIST"),
+    # NOTE: IZMO removed from watchlist — already in PORTFOLIO (same NSE symbol = duplicate alerts)
+    dict(ticker="ONEGLOBAL",  name="One Global Service",      nse="ONEGLOBAL",   bse=None,     sector="Business Services",   cat="WATCHLIST"),
+    dict(ticker="DOMS",       name="DOMS Industries",         nse="DOMS",        bse="544045", sector="Consumer Stationery", cat="WATCHLIST"),
+    dict(ticker="LANCER",     name="Lancer Container",        nse=None,          bse="526807", sector="Packaging",           cat="WATCHLIST"),
+    # ── Turnaround Stocks ─────────────────────────────────────────────────
+    dict(ticker="HFCL",       name="HFCL Ltd",                nse="HFCL",        bse="500183", sector="Telecom Infra",       cat="WATCHLIST"),
+    dict(ticker="BORORENEW",  name="Boro Renewables",         nse="BORORENEW",   bse=None,     sector="Renewable Energy",    cat="WATCHLIST"),
+    dict(ticker="IDEAFORGE",  name="ideaForge Technology",    nse="IDEAFORGE",   bse="543932", sector="Defence Drones",      cat="WATCHLIST"),
+    dict(ticker="NAVKARCORP", name="Navkar Corporation",      nse="NAVKARCORP",  bse="539332", sector="Logistics",           cat="WATCHLIST"),
+    dict(ticker="RKFORGE",    name="Ramkrishna Forgings",     nse="RKFORGE",     bse="500368", sector="Auto Forgings",       cat="WATCHLIST"),
+    dict(ticker="SIS",        name="SIS Ltd",                 nse="SIS",         bse="540673", sector="Security Services",   cat="WATCHLIST"),
+    dict(ticker="IBULLSLTD",  name="Indiabulls Ltd",          nse="IBULLSLTD",   bse="535789", sector="NBFC",                cat="WATCHLIST"),
+    dict(ticker="FABTECH",    name="Fabtech Technologies",    nse="FABTECH",     bse=None,     sector="Engineering",         cat="WATCHLIST"),
+    dict(ticker="E2E",        name="E2E Networks",            nse="E2ENETWORKS", bse="543421", sector="Cloud Infra",         cat="WATCHLIST"),
+    dict(ticker="NPL",        name="NPL",                     nse="NPL",         bse=None,     sector="Manufacturing",       cat="WATCHLIST"),
+    dict(ticker="AURUM",      name="Aurum PropTech",          nse="AURUM",       bse="543088", sector="PropTech",            cat="WATCHLIST"),
+    dict(ticker="MARSONS",    name="Marsons Ltd",             nse="MARSONS",     bse="522080", sector="Electrical Equip",    cat="WATCHLIST"),
+    dict(ticker="HARSHA",     name="Harsha Engineers",        nse="HARSHA",      bse="543457", sector="Precision Engg",      cat="WATCHLIST"),
+    dict(ticker="RAYMOND",    name="Raymond Ltd",             nse="RAYMOND",     bse="500330", sector="Lifestyle & RE",      cat="WATCHLIST"),
+    dict(ticker="MARINE",     name="Marine Electricals",      nse="MARINE",      bse=None,     sector="Electrical Equip",    cat="WATCHLIST"),
+    dict(ticker="KMEW",       name="KMEW",                    nse="KMEW",        bse=None,     sector="Manufacturing",       cat="WATCHLIST"),
+    dict(ticker="MODISONLTD", name="Modison Ltd",             nse="MODISONLTD",  bse=None,     sector="Electrical Contacts", cat="WATCHLIST"),
+    dict(ticker="RATEGAIN",   name="RateGain Travel Tech",    nse="RATEGAIN",    bse="543417", sector="Travel Tech SaaS",    cat="WATCHLIST"),
 ]
 
 ALL_STOCKS = PORTFOLIO + WATCHLIST
@@ -191,34 +256,80 @@ def classify(title, cat_raw=""):
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS sent_filings (
-        hash TEXT PRIMARY KEY, ticker TEXT,
-        title TEXT, source TEXT, sent_at INTEGER)""")
+        hash       TEXT PRIMARY KEY,
+        ticker     TEXT,
+        nse_sym    TEXT,
+        title      TEXT,
+        source     TEXT,
+        sent_at    INTEGER
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, ts INTEGER)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg TEXT, ts INTEGER
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS weekly_digest_sent (
+        week_id TEXT PRIMARY KEY,
+        sent_at INTEGER
+    )""")
     conn.execute("DELETE FROM sent_filings WHERE sent_at < ?",
                  (int(time.time()) - 30*86400,))
     conn.commit()
     log.info("Database ready ✅")
     return conn
 
-def _h(src, tick, title):
-    return hashlib.sha256(
-        f"{src}:{tick}:{title.strip().lower()}".encode()).hexdigest()
+def _h(nse_sym_or_ticker, title, source):
+    """
+    FIX: Use NSE symbol (not ticker) as dedup key.
+    IZMO (portfolio) and IZMOWATCH (watchlist) share nse="IZMO"
+    so the second one is correctly skipped.
+    """
+    key = f"{source}:{nse_sym_or_ticker}:{title.strip().lower()}"
+    return hashlib.sha256(key.encode()).hexdigest()
 
-def is_dup(conn, src, tick, title):
+def is_dup(conn, stock, title, source):
+    dedup_key = stock.get("nse") or stock["ticker"]
     return conn.execute(
-        "SELECT 1 FROM sent_filings WHERE hash=?", (_h(src, tick, title),)
+        "SELECT 1 FROM sent_filings WHERE hash=?",
+        (_h(dedup_key, title, source),)
     ).fetchone() is not None
 
-def mark(conn, src, tick, title):
-    conn.execute("INSERT OR IGNORE INTO sent_filings VALUES (?,?,?,?,?)",
-                 (_h(src, tick, title), tick, title[:200], src, int(time.time())))
+def mark(conn, stock, title, source):
+    dedup_key = stock.get("nse") or stock["ticker"]
+    conn.execute(
+        "INSERT OR IGNORE INTO sent_filings VALUES (?,?,?,?,?,?)",
+        (_h(dedup_key, title, source),
+         stock["ticker"], dedup_key, title[:200],
+         source, int(time.time()))
+    )
     conn.commit()
 
 def log_err(conn, msg):
     conn.execute("INSERT INTO errors VALUES (NULL,?,?)",
                  (msg[:500], int(time.time())))
     conn.commit()
+
+def is_semantic_dup(conn, stock, title, source):
+    """
+    Checks if same company filed something very similar in last 30 min
+    from the OTHER exchange (NSE vs BSE cross-dedup).
+    Prevents double-alerts for same board meeting on both exchanges.
+    """
+    dedup_key = stock.get("nse") or stock["ticker"]
+    cutoff = int(time.time()) - 1800
+    recent = conn.execute(
+        "SELECT title FROM sent_filings WHERE nse_sym=? AND sent_at>? AND source!=?",
+        (dedup_key, cutoff, source)
+    ).fetchall()
+    if not recent: return False
+    title_words = set(re.findall(r'\w+', title.lower()))
+    for (rt,) in recent:
+        rt_words = set(re.findall(r'\w+', rt.lower()))
+        if not title_words: continue
+        overlap = len(title_words & rt_words) / len(title_words)
+        if overlap > 0.75:
+            log.debug(f"  Semantic dup skipped ({overlap:.0%} overlap): {title[:50]}")
+            return True
+    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NSE SESSION
@@ -264,97 +375,89 @@ class NSESession:
             return None
 
 nse = NSESession()
-BSE_H = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer":    "https://www.bseindia.com/",
-    "Origin":     "https://www.bseindia.com"
-}
+BSE_H = {"User-Agent":"Mozilla/5.0","Referer":"https://www.bseindia.com/","Origin":"https://www.bseindia.com"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NSE LIVE MARKET DATA — for volume + price context in AI analysis
+# NSE LIVE QUOTE (price + volume for AI context + P&L)
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_nse_quote(nse_sym):
-    """
-    Fetches live market data: price, % change, 52w high/low, today's volume.
-    Used to give AI institutional context for analysis.
-    """
-    if not nse_sym:
-        return None
-    url = f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}"
-    r = nse.get(url)
-    if not r or not r.ok:
-        return None
+def fetch_quote(nse_sym):
+    if not nse_sym: return None
+    r = nse.get(f"https://www.nseindia.com/api/quote-equity?symbol={nse_sym}")
+    if not r or not r.ok: return None
     try:
-        data = r.json()
-        pi  = data.get("priceInfo", {})
-        ti  = data.get("tradedInfo", {})
+        d   = r.json()
+        pi  = d.get("priceInfo", {})
+        ti  = d.get("tradedInfo", {})
         whl = pi.get("weekHighLow", {})
-
-        ltp        = pi.get("lastPrice")
-        change_pct = pi.get("pChange")
-        w52_high   = whl.get("max")
-        w52_low    = whl.get("min")
-        vol_today  = ti.get("totalTradedVolume")
-        avg_vol_1y = ti.get("tottrdqty")  # approximate
-
-        # Position in 52-week range (0% = at low, 100% = at high)
+        ltp       = pi.get("lastPrice")
+        chg_pct   = pi.get("pChange")
+        w52_hi    = whl.get("max")
+        w52_lo    = whl.get("min")
+        vol_today = ti.get("totalTradedVolume")
+        avg_vol   = ti.get("tottrdqty")
         range_pct = None
-        if ltp and w52_high and w52_low:
-            try:
-                span = float(w52_high) - float(w52_low)
-                if span > 0:
-                    range_pct = round(((float(ltp) - float(w52_low)) / span) * 100, 1)
-            except:
-                pass
-
-        # Volume ratio vs average
         vol_ratio = None
-        if vol_today and avg_vol_1y:
+        if ltp and w52_hi and w52_lo:
             try:
-                vol_ratio = round(float(vol_today) / float(avg_vol_1y) * 100, 1)
-            except:
-                pass
-
-        return {
-            "ltp":        ltp,
-            "change_pct": change_pct,
-            "w52_high":   w52_high,
-            "w52_low":    w52_low,
-            "vol_today":  vol_today,
-            "avg_vol":    avg_vol_1y,
-            "range_pct":  range_pct,
-            "vol_ratio":  vol_ratio,
-        }
+                span = float(w52_hi) - float(w52_lo)
+                if span > 0:
+                    range_pct = round(((float(ltp) - float(w52_lo)) / span) * 100, 1)
+            except: pass
+        if vol_today and avg_vol:
+            try:
+                vol_ratio = round(float(vol_today) / float(avg_vol) * 100, 1)
+            except: pass
+        return dict(ltp=ltp, chg_pct=chg_pct, w52_hi=w52_hi, w52_lo=w52_lo,
+                    vol_today=vol_today, avg_vol=avg_vol,
+                    range_pct=range_pct, vol_ratio=vol_ratio)
     except Exception as e:
-        log.debug(f"NSE quote {nse_sym}: {e}")
+        log.debug(f"Quote {nse_sym}: {e}")
         return None
 
-def fmt_market_context(q):
-    """Format market data as text for AI prompt."""
-    if not q:
-        return "Live market data unavailable — analyze filing on fundamentals only."
+def fmt_market_ctx(q):
+    if not q: return "Live data unavailable"
+    ltp  = f"₹{q['ltp']}"      if q.get("ltp")     else "N/A"
+    chg  = f"{q['chg_pct']}%"  if q.get("chg_pct") else "N/A"
+    hi52 = f"₹{q['w52_hi']}"   if q.get("w52_hi")  else "N/A"
+    lo52 = f"₹{q['w52_lo']}"   if q.get("w52_lo")  else "N/A"
 
-    ltp    = f"₹{q['ltp']}"       if q.get("ltp")       else "N/A"
-    chg    = f"{q['change_pct']}%" if q.get("change_pct") else "N/A"
-    hi52   = f"₹{q['w52_high']}"  if q.get("w52_high")  else "N/A"
-    lo52   = f"₹{q['w52_low']}"   if q.get("w52_low")   else "N/A"
-    rng    = (f"{q['range_pct']}% above 52w low (closer to "
-              f"{'high — extended' if q['range_pct'] > 70 else 'low — value zone' if q['range_pct'] < 30 else 'midpoint'}"
-              f")") if q.get("range_pct") is not None else "N/A"
+    if q.get("range_pct") is not None:
+        rp = q["range_pct"]
+        zone = "near 52w HIGH — extended" if rp > 70 else \
+               "near 52w LOW — value zone" if rp < 30 else "mid-range"
+        rng = f"{rp}% above 52w low ({zone})"
+    else:
+        rng = "N/A"
 
-    vol_t  = f"{int(q['vol_today']):,}" if q.get("vol_today") else "N/A"
-    vol_r  = (f"{q['vol_ratio']}% of annual average "
-              f"({'HIGH — institutional activity likely' if q['vol_ratio'] > 150 else 'LOW — limited interest' if q['vol_ratio'] < 50 else 'normal'})"
-              ) if q.get("vol_ratio") is not None else "N/A"
+    if q.get("vol_ratio") is not None:
+        vr = q["vol_ratio"]
+        vsig = "HIGH — possible institutional activity" if vr > 150 else \
+               "LOW — limited institutional interest" if vr < 50 else "normal"
+        vol = f"{int(q['vol_today']):,} shares ({vr}% of annual avg — {vsig})"
+    else:
+        vol = f"{q.get('vol_today','N/A')} shares"
 
-    return (
-        f"Current Price: {ltp} ({chg} today)\n"
-        f"52-Week Range: {lo52} → {hi52} | Position: {rng}\n"
-        f"Today's Volume: {vol_t} shares | vs Annual Average: {vol_r}"
-    )
+    return (f"Price: {ltp} ({chg} today)\n"
+            f"52w Range: {lo52} → {hi52} | Position: {rng}\n"
+            f"Volume: {vol}")
+
+def fmt_pnl(stock, ltp):
+    """Calculate and format P&L for portfolio stocks."""
+    if not stock.get("avg") or not stock.get("qty") or not ltp:
+        return None
+    avg = stock["avg"]; qty = stock["qty"]
+    invested = qty * avg
+    current  = qty * float(ltp)
+    pnl      = current - invested
+    pnl_pct  = (pnl / invested) * 100
+    arrow    = "📈" if pnl >= 0 else "📉"
+    sign     = "+" if pnl >= 0 else ""
+    return (f"{arrow} <b>Your Position:</b> {qty} shares @ ₹{avg:,.2f} avg\n"
+            f"   Invested: ₹{invested:,.0f} → Now: ₹{current:,.0f}\n"
+            f"   P&amp;L: <b>{sign}₹{pnl:,.0f} ({sign}{pnl_pct:.1f}%)</b>")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FETCHERS — NSE + BSE official APIs
+# FETCHERS
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_nse_filings(sym):
     if not sym: return []
@@ -435,143 +538,117 @@ def fetch_bse_ca(code):
         return []
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI ANALYSIS — Institutional level prompt with market data
+# AI — Institutional prompt | 70B for HIGH | 8B for others
 # ─────────────────────────────────────────────────────────────────────────────
-INSTITUTIONAL_PROMPT = """You are a senior equity research analyst at a top Indian institutional fund (like Mirae Asset or Kotak Mutual Fund). A filing has just hit the exchange. Analyze it with full institutional rigor.
+INST_PROMPT = """You are a senior equity research analyst at a top Indian institutional fund.
 
-━━ FILING DETAILS ━━
-Headline: "{title}"
-Company: {company}
-Sector: {sector}
-Filing Type: {category}
+━━ FILING ━━
+"{title}"
+Company: {company} | Sector: {sector} | Type: {category}
 
 ━━ LIVE MARKET DATA ━━
 {market_context}
 
-━━ YOUR ANALYSIS TASK ━━
-Analyze this filing like a senior fund manager would. Consider:
-1. FUNDAMENTAL IMPACT: Revenue, margins, balance sheet, earnings per share effect
-2. VALUATION TRIGGER: Does this change the re-rating thesis? P/E expansion or compression?
-3. INSTITUTIONAL PERSPECTIVE: Would FIIs/DIIs accumulate, hold, or trim on this news?
-4. VOLUME SIGNAL: Compare today's volume vs annual average — is smart money active?
-5. PRICE SETUP: Where is stock in 52-week range — is this filing a breakout catalyst or risk?
-6. SECTOR CONTEXT: How does this compare to what peers are doing?
+━━ TASK ━━
+Analyze like a fund manager. Cover:
+1. Fundamental impact (revenue/margins/EPS effect)
+2. Re-rating trigger? (P/E expansion or compression)
+3. What would FIIs/DIIs do — accumulate, hold, or trim?
+4. Volume vs annual average — smart money signal?
+5. Price position in 52w range — breakout catalyst or risk?
 
-Respond ONLY with this JSON — no markdown, no backticks, no explanation outside JSON:
-{{
-  "summary": "3-4 sentences of institutional analysis — cover fundamental impact, what this means for the re-rating thesis, and what FIIs/DIIs are likely thinking",
-  "volume_signal": "1 sentence — compare today's volume to annual average, state clearly if institutional accumulation or distribution is likely based on the volume pattern",
-  "price_setup": "1 sentence — where stock sits in 52w range, whether this filing is a breakout catalyst or a risk flag",
-  "sector_view": "1 sentence — how this compares to sector peers or macro trends",
-  "sentiment": "bullish OR bearish OR neutral",
-  "impact": "high OR medium OR low",
-  "action": "BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID",
-  "horizon": "short_term OR medium_term OR long_term",
-  "reason": "One specific actionable sentence — include price levels or % targets where possible"
-}}"""
+Respond ONLY with JSON (no markdown, no backticks):
+{{"summary":"3-4 sentences institutional analysis — fundamental impact, re-rating thesis, FII/DII likely action","volume_signal":"1 sentence — volume vs annual average and what it implies about institutional interest","price_setup":"1 sentence — 52w range position and whether this filing is a breakout catalyst","sector_view":"1 sentence — comparison to sector peers or macro trend","sentiment":"bullish OR bearish OR neutral","impact":"high OR medium OR low","action":"BUY MORE OR HOLD OR WATCH OR REDUCE OR AVOID","horizon":"short_term OR medium_term OR long_term","reason":"One specific actionable sentence with price levels or % where possible"}}"""
 
-def parse_ai_json(text):
+def _parse_ai(text):
     text = re.sub(r"```json\n?|```", "", text).strip()
     m = re.search(r"\{[\s\S]+?\}", text)
     if not m: return None
     try:
-        res = json.loads(m.group())
-        res["sentiment"] = res.get("sentiment", "neutral").lower()
-        res["impact"]    = res.get("impact", "medium").lower()
-        res["action"]    = res.get("action", "WATCH").upper()
-        res["horizon"]   = res.get("horizon", "medium_term").lower()
-        if res["sentiment"] not in ["bullish","bearish","neutral"]:
-            res["sentiment"] = "neutral"
-        if res["impact"] not in ["high","medium","low"]:
-            res["impact"] = "medium"
-        return res
-    except Exception as e:
-        log.debug(f"AI JSON parse: {e}")
-        return None
+        r = json.loads(m.group())
+        r["sentiment"] = r.get("sentiment","neutral").lower()
+        r["impact"]    = r.get("impact","medium").lower()
+        r["action"]    = r.get("action","WATCH").upper()
+        r["horizon"]   = r.get("horizon","medium_term").lower()
+        if r["sentiment"] not in ["bullish","bearish","neutral"]: r["sentiment"]="neutral"
+        if r["impact"]    not in ["high","medium","low"]:         r["impact"]="medium"
+        return r
+    except: return None
 
-def groq_analyze(title, company, sector, category, market_ctx):
+def groq_analyze(title, company, sector, category, mctx, importance):
     if not GROQ_API_KEY: return None
-    prompt = INSTITUTIONAL_PROMPT.format(
-        title=title, company=company, sector=sector,
-        category=category, market_context=market_ctx)
+    # Use 70B for HIGH importance filings — much better analysis
+    model = GROQ_MODEL_HIGH if importance == "HIGH" else GROQ_MODEL_STD
+    prompt = INST_PROMPT.format(title=title, company=company, sector=sector,
+                                 category=category, market_context=mctx)
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                      "Content-Type": "application/json"},
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": model,
                 "messages": [
-                    {"role": "system",
-                     "content": ("You are an expert Indian stock market institutional analyst. "
-                                 "Always respond with valid JSON only. No markdown. No text outside JSON.")},
-                    {"role": "user", "content": prompt}
+                    {"role":"system","content":"Expert Indian institutional stock analyst. JSON only. No markdown."},
+                    {"role":"user","content":prompt}
                 ],
                 "temperature": 0.2,
                 "max_tokens": 500
             },
-            timeout=25
+            timeout=30
         )
         if not r.ok:
-            log.warning(f"Groq {r.status_code}: {r.text[:150]}")
+            log.warning(f"Groq({model}) {r.status_code}: {r.text[:150]}")
             return None
         content = r.json()["choices"][0]["message"]["content"]
-        result = parse_ai_json(content)
+        result  = _parse_ai(content)
         if result:
-            log.info(f"  Groq: {result['sentiment']} | {result['action']} | {result['horizon']}")
+            log.info(f"  AI({model.split('-')[-1]}): {result['sentiment']} | {result['action']}")
         return result
     except Exception as e:
-        log.warning(f"Groq error: {e}")
+        log.warning(f"Groq: {e}")
         return None
 
-def gemini_analyze(title, company, sector, category, market_ctx):
+def gemini_analyze(title, company, sector, category, mctx, importance):
     if not GEMINI_API_KEY: return None
-    prompt = INSTITUTIONAL_PROMPT.format(
-        title=title, company=company, sector=sector,
-        category=category, market_context=market_ctx)
-    for model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+    prompt = INST_PROMPT.format(title=title, company=company, sector=sector,
+                                 category=category, market_context=mctx)
+    for model in ["gemini-2.0-flash","gemini-1.5-flash"]:
         try:
             r = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={GEMINI_API_KEY}",
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.2, "maxOutputTokens": 500}},
-                timeout=25
-            )
+                json={"contents":[{"parts":[{"text":prompt}]}],
+                      "generationConfig":{"temperature":0.2,"maxOutputTokens":500}},
+                timeout=25)
             if not r.ok: continue
             text   = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            result = parse_ai_json(text)
-            if result:
-                log.info(f"  Gemini({model}): {result['sentiment']} | {result['action']}")
-                return result
+            result = _parse_ai(text)
+            if result: return result
         except Exception as e:
             log.warning(f"Gemini {model}: {e}")
     return None
 
-def ai_analyze(title, company, sector, category, nse_sym):
-    """Fetch live market data first, then run institutional AI analysis."""
-    # Get live price + volume data for context
-    quote = fetch_nse_quote(nse_sym) if nse_sym else None
-    market_ctx = fmt_market_context(quote)
-
-    # Try Groq first, fallback to Gemini
-    result = None
+def ai_analyze(title, company, sector, category, nse_sym, importance):
+    q    = fetch_quote(nse_sym) if nse_sym else None
+    mctx = fmt_market_ctx(q)
+    res  = None
     if GROQ_API_KEY:
-        result = groq_analyze(title, company, sector, category, market_ctx)
-    if not result and GEMINI_API_KEY:
-        result = gemini_analyze(title, company, sector, category, market_ctx)
-
-    if result:
-        result["_market_ctx"] = market_ctx  # attach for message display
-    return result
+        res = groq_analyze(title, company, sector, category, mctx, importance)
+    if not res and GEMINI_API_KEY:
+        res = gemini_analyze(title, company, sector, category, mctx, importance)
+    if res:
+        res["_quote"]  = q
+        res["_mctx"]   = mctx
+    return res
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MESSAGE BUILDER — shows full institutional analysis
+# MESSAGE BUILDER — full institutional format
 # ─────────────────────────────────────────────────────────────────────────────
 SE = {"bullish":"🟢","bearish":"🔴","neutral":"🟡"}
 IE = {"high":"🔥","medium":"⚡","low":"💧"}
 AE = {"BUY MORE":"🚀","HOLD":"✋","WATCH":"👀","REDUCE":"⚠️","AVOID":"🚫"}
-HE = {"short_term":"⚡ Short Term","medium_term":"📆 Medium Term","long_term":"🏔 Long Term"}
+HZ = {"short_term":"⚡ Short-Term","medium_term":"📆 Medium-Term","long_term":"🏔 Long-Term"}
 
 def now_ist():
     return datetime.now(IST).strftime("%d %b %Y · %I:%M %p IST")
@@ -579,57 +656,65 @@ def now_ist():
 def build_msg(stock, source, filing, cat_label, importance, ai):
     ce  = "📊" if stock["cat"] == "PORTFOLIO" else "👁"
     itg = {"HIGH":"🔴 HIGH","MEDIUM":"🟡 MEDIUM","LOW":"🟢 LOW"}.get(importance,"🟡")
-    L = [
-        "━"*24,
-        f"🏛 <b>{source} OFFICIAL FILING</b>",
-        "━"*24,
-        f"{ce} <b>{stock['cat']}</b>  ·  <code>{stock['ticker']}</code>",
-        f"🏢 <b>{stock['name']}</b>  |  🏭 {stock['sector']}",
-        f"🏷 {cat_label}  ·  {itg}",
-        "",
-        f"📄 <b>{filing['title']}</b>",
-        "",
-    ]
+    _, mkt_status = get_market_status()
+    after_hours   = market_flag(mkt_status)
+    urgency_tag, days_left = get_urgency(filing["title"])
 
+    L = ["━"*24,
+         f"🏛 <b>{source} OFFICIAL FILING</b>",
+         "━"*24,
+         f"{ce} <b>{stock['cat']}</b>  ·  <code>{stock['ticker']}</code>",
+         f"🏢 <b>{stock['name']}</b>  |  🏭 {stock['sector']}",
+         f"🏷 {cat_label}  ·  {itg}",
+         ""]
+
+    # After-hours flag
+    if after_hours:
+        L.append(after_hours)
+        L.append("")
+
+    # Urgency flag
+    if urgency_tag:
+        L.append(urgency_tag)
+        L.append("")
+
+    L += [f"📄 <b>{filing['title']}</b>", ""]
+
+    # P&L context for portfolio stocks
+    if stock["cat"] == "PORTFOLIO" and ai and ai.get("_quote"):
+        pnl_line = fmt_pnl(stock, ai["_quote"].get("ltp"))
+        if pnl_line:
+            L.append(pnl_line)
+            L.append("")
+
+    # Market context
+    if ai and ai.get("_mctx") and ai["_mctx"] != "Live data unavailable":
+        L += ["📈 <b>Live Market Data</b>",
+              f"<code>{ai['_mctx']}</code>", ""]
+
+    # Institutional AI analysis
     if ai:
-        # Market context block
-        mctx = ai.get("_market_ctx", "")
-        if mctx and mctx != "Live market data unavailable — analyze filing on fundamentals only.":
-            L += [
-                "📈 <b>Market Context</b>",
-                f"<code>{mctx}</code>",
-                "",
-            ]
-
-        # Institutional AI analysis
-        L += [
-            "🏦 <b>Institutional Analysis</b>",
-            "─"*22,
-            f"📝 {ai.get('summary','')}",
-            "",
-            f"📊 <b>Volume Signal:</b> {ai.get('volume_signal','')}",
-            f"🎯 <b>Price Setup:</b> {ai.get('price_setup','')}",
-            f"🌐 <b>Sector View:</b> {ai.get('sector_view','')}",
-            "",
-            f"{SE.get(ai['sentiment'],'🟡')} Sentiment: <b>{ai['sentiment'].capitalize()}</b>",
-            f"{IE.get(ai['impact'],'⚡')} Market Impact: <b>{ai['impact'].capitalize()}</b>",
-            f"{AE.get(ai['action'],'👀')} Action Signal: <b>{ai['action']}</b>",
-            f"⏳ Horizon: <b>{HE.get(ai['horizon'], ai['horizon'])}</b>",
-            f"💡 {ai.get('reason','')}",
-            "",
-        ]
+        L += ["🏦 <b>Institutional Analysis</b>",
+              "─"*22,
+              f"📝 {ai.get('summary','')}",
+              "",
+              f"📊 <b>Volume Signal:</b> {ai.get('volume_signal','')}",
+              f"🎯 <b>Price Setup:</b> {ai.get('price_setup','')}",
+              f"🌐 <b>Sector View:</b> {ai.get('sector_view','')}",
+              "",
+              f"{SE.get(ai['sentiment'],'🟡')} Sentiment: <b>{ai['sentiment'].capitalize()}</b>",
+              f"{IE.get(ai['impact'],'⚡')} Market Impact: <b>{ai['impact'].capitalize()}</b>",
+              f"{AE.get(ai['action'],'👀')} Action Signal: <b>{ai['action']}</b>",
+              f"⏳ Horizon: <b>{HZ.get(ai['horizon'], ai['horizon'])}</b>",
+              f"💡 {ai.get('reason','')}",
+              ""]
     else:
-        L += [
-            "⚠️ <i>Add GROQ_API_KEY in Railway for institutional AI analysis</i>",
-            "",
-        ]
+        L += ["⚠️ <i>Add GROQ_API_KEY in Railway for AI analysis</i>", ""]
 
     if filing.get("date"):
         L.append(f"📅 Filed: {filing['date']}")
-    L += [
-        f"🔗 <a href=\"{filing['link']}\">View Official Filing on {source}</a>",
-        f"⏰ {now_ist()}",
-    ]
+    L += [f"🔗 <a href=\"{filing['link']}\">View on {source}</a>",
+          f"⏰ {now_ist()}"]
     return "\n".join(L)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -642,9 +727,8 @@ def send_tg(text, retries=3):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": text[:4000],
-                      "parse_mode": "HTML",
-                      "disable_web_page_preview": True},
+                json={"chat_id":CHAT_ID, "text":text[:4000],
+                      "parse_mode":"HTML", "disable_web_page_preview":True},
                 timeout=12)
             if r.ok: return True
             if r.status_code == 429:
@@ -655,6 +739,51 @@ def send_tg(text, retries=3):
         except Exception as e:
             log.error(f"TG: {e}"); time.sleep(5)
     return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEEKLY DIGEST — every Monday 8 AM IST
+# ─────────────────────────────────────────────────────────────────────────────
+def maybe_send_weekly_digest(conn):
+    now = datetime.now(IST)
+    if now.weekday() != 0 or now.hour != 8: return  # Monday 8 AM only
+    week_id = now.strftime("%Y-W%W")
+    if conn.execute("SELECT 1 FROM weekly_digest_sent WHERE week_id=?",
+                    (week_id,)).fetchone(): return
+
+    week_ago = int(time.time()) - 7 * 86400
+    rows = conn.execute(
+        "SELECT ticker, title, source FROM sent_filings WHERE sent_at > ? ORDER BY ticker, sent_at DESC",
+        (week_ago,)
+    ).fetchall()
+
+    if not rows:
+        return
+
+    by_ticker = {}
+    for ticker, title, source in rows:
+        by_ticker.setdefault(ticker, []).append(f"  [{source}] {title[:55]}")
+
+    lines = [
+        "━"*24,
+        "📋 <b>WEEKLY FILING DIGEST</b>",
+        f"Week ending {now.strftime('%d %b %Y')}",
+        "━"*24,
+        f"Total filings this week: <b>{len(rows)}</b>",
+        f"Stocks with activity: <b>{len(by_ticker)}</b>",
+        "",
+    ]
+    for ticker in sorted(by_ticker.keys()):
+        events = by_ticker[ticker]
+        lines.append(f"<b>{ticker}</b> ({len(events)} filing{'s' if len(events)>1 else ''})")
+        lines.extend(events[:4])
+        lines.append("")
+
+    lines += ["━"*24, "Have a great trading week! 🚀"]
+    send_tg("\n".join(lines))
+    conn.execute("INSERT OR IGNORE INTO weekly_digest_sent VALUES (?,?)",
+                 (week_id, int(time.time())))
+    conn.commit()
+    log.info("Weekly digest sent ✅")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROCESS STOCK
@@ -671,14 +800,15 @@ def process(stock, conn):
         time.sleep(0.5)
 
     for source, f in all_f:
-        if not is_recent(f.get("date",""), FILING_MAX_AGE_DAYS): continue
+        if not is_recent(f.get("date","")): continue
         cat_label, importance = classify(f["title"], f.get("category",""))
         if cat_label is None: continue
-        if is_dup(conn, source, stock["ticker"], f["title"]): continue
-        mark(conn, source, stock["ticker"], f["title"])
+        if is_dup(conn, stock, f["title"], source): continue
+        if is_semantic_dup(conn, stock, f["title"], source): continue
+        mark(conn, stock, f["title"], source)
         log.info(f"  [{source}][{stock['ticker']}][{importance}] {f['title'][:65]}")
         ai  = ai_analyze(f["title"], stock["name"], stock["sector"],
-                         cat_label, stock.get("nse"))
+                         cat_label, stock.get("nse"), importance)
         msg = build_msg(stock, source, f, cat_label, importance, ai)
         if send_tg(msg):
             sent += 1
@@ -686,9 +816,10 @@ def process(stock, conn):
     return sent
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CYCLE + STARTUP
+# CYCLE
 # ─────────────────────────────────────────────────────────────────────────────
 def run_cycle(conn):
+    maybe_send_weekly_digest(conn)
     log.info(f"━━ Cycle {datetime.now(IST).strftime('%H:%M:%S IST')} ━━")
     total = 0
     for stock in ALL_STOCKS:
@@ -699,35 +830,31 @@ def run_cycle(conn):
             log_err(conn, str(e))
     log.info(f"━━ Done. {total} sent ━━\n")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────────────────────────────────────────
 def send_startup():
     ai_info = (
-        "✅ Groq LLaMA 3.1 (institutional analysis)" if GROQ_API_KEY else
-        "✅ Gemini (fallback)" if GEMINI_API_KEY else
-        "❌ No AI — add GROQ_API_KEY in Railway"
+        f"✅ Groq (70B for HIGH / 8B for others)" if GROQ_API_KEY else
+        f"✅ Gemini (fallback)" if GEMINI_API_KEY else
+        "❌ No AI key — add GROQ_API_KEY"
     )
-    turnaround = ["HFCL","BORORENEW","IDEAFORGE","NAVKARCORP","RKFORGE",
-                  "SIS","IBULLSLTD","FABTECH","E2E","NPL","AURUM",
-                  "MARSONS","HARSHA","RAYMOND","MARINE","KMEW",
-                  "MODISONLTD","RATEGAIN"]
     msg = (
         f"{'━'*24}\n"
-        f"🚀 <b>StockPilot Bot v3.5</b>\n"
+        f"🚀 <b>StockPilot Bot v3.6</b>\n"
         f"{'━'*24}\n"
         f"⏰ {datetime.now(IST).strftime('%d %b %Y · %I:%M %p IST')}\n\n"
-        f"📊 <b>Portfolio ({len(PORTFOLIO)}):</b>\n"
-        f"<code>{' · '.join(s['ticker'] for s in PORTFOLIO)}</code>\n\n"
-        f"👁 <b>Watchlist ({len(WATCHLIST)}):</b>\n"
-        f"<code>{' · '.join(s['ticker'] for s in WATCHLIST)}</code>\n\n"
-        f"📈 <b>Turnaround stocks added ({len(turnaround)}):</b>\n"
-        f"<code>{' · '.join(turnaround)}</code>\n\n"
-        f"✅ <b>v3.5 fixes:</b>\n"
-        f"  • PENIND → PENNARINT (Pennar Industries)\n"
-        f"  • 18 turnaround stocks added to watchlist\n"
-        f"  • Institutional-level AI with market data\n"
-        f"  • Volume vs annual average in every alert\n"
-        f"  • 52-week price context in every alert\n\n"
+        f"📊 Portfolio: {len(PORTFOLIO)} stocks (with avg buy price)\n"
+        f"👁 Watchlist: {len(WATCHLIST)} stocks (incl. 18 turnaround)\n\n"
+        f"<b>✅ v3.6 loopholes fixed:</b>\n"
+        f"  🌙 After-hours filing flag\n"
+        f"  🚨 Ex-date urgency (URGENT/UPCOMING)\n"
+        f"  📈 P&amp;L context in every portfolio alert\n"
+        f"  🏦 70B model for HIGH priority filings\n"
+        f"  📋 Weekly digest every Monday 8 AM\n"
+        f"  🔄 Smart semantic dedup (NSE+BSE cross)\n"
+        f"  ✂️ IZMO watchlist duplicate removed\n\n"
         f"🤖 AI: {ai_info}\n"
-        f"📅 Age filter: last {FILING_MAX_AGE_DAYS} days\n"
         f"🔄 Every {CHECK_INTERVAL//60} min\n"
         f"{'━'*24}"
     )
@@ -738,7 +865,7 @@ def send_startup():
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     validate_config()
-    log.info("StockPilot Bot v3.5 starting…")
+    log.info("StockPilot Bot v3.6 starting…")
     conn = init_db()
     nse.warm()
     send_startup()
@@ -751,7 +878,7 @@ def main():
             break
         except Exception as e:
             errs += 1
-            log.error(f"Cycle error #{errs}: {e}", exc_info=True)
+            log.error(f"Cycle #{errs}: {e}", exc_info=True)
             log_err(conn, str(e))
             if errs >= 5:
                 send_tg(f"⚠️ 5 errors\nLast: {str(e)[:200]}")
